@@ -6,13 +6,13 @@ tags: [DPU, BlueField, HBN, NICo, NSG, DPF, OVN-Kubernetes, NetworkPolicy, EVPN,
 mermaid: true
 ---
 
-🔍**Understanding DPU-based network isolation in a multi-tenant AI Factory.**
+🔍 **Understanding DPU-based network isolation in a multi-tenant AI Factory.**
 
 > NVIDIA BlueField can enforce network isolation before traffic reaches the host.
 >
-> HBN provides the DPU-side routing and EVPN/VXLAN functions, NICo provides tenant-facing VPC and NSG abstractions, and OVN-Kubernetes provides workload-level `NetworkPolicy`.
+> HBN provides DPU-side routing and EVPN/VXLAN functions, NICo provides tenant-facing VPC and NSG abstractions, and OVN-Kubernetes provides Kubernetes workload networking and `NetworkPolicy`.
 >
-> The key is to separate **routing**, **tenant ACL policy**, and **workload ACL policy**.
+> The key is to separate **routing**, **tenant ACL policy**, **workload ACL policy**, and **service-chain traffic steering**.
 
 ---
 
@@ -22,20 +22,35 @@ HBN is a `DPUService` that provides routing and network functions on BlueField.
 
 According to the [DPF architecture overview](https://networking-docs.nvidia.com/dpf/26.4.0/overview), DPU services are deployed into the `DPUCluster` and run on DPU nodes.
 
-HBN can cover both native routing and EVPN/VXLAN overlay functions.
+HBN can provide both native L3 routing and EVPN/VXLAN overlay functions.
 
 ```text
 HBN DPUService
+
  ├─ Native L3 / BGP
  ├─ VRF
  ├─ EVPN
  ├─ VXLAN / VNI
- └─ HBN / NVUE ACL
+ └─ ACL / NAT
 ```
 
-The HBN ACL framework is therefore **not underlay-only**. It is a generic ACL capability used in different HBN traffic contexts.
+HBN ACL is therefore **not an underlay-only firewall function**.
 
-Official reference: [NVIDIA HBN Service Configuration](https://docs.nvidia.com/doca/sdk/hbn%2Bservice%2Bconfiguration/index.html)
+It is a generic HBN dataplane filtering capability that can be applied at supported HBN interfaces depending on the traffic path and ACL type.
+
+NVUE is used to configure this HBN network state.
+
+```text
+NVUE
+  ↓
+HBN configuration
+  ↓
+HBN dataplane enforcement
+```
+
+Official reference:
+
+- [NVIDIA HBN Service Configuration](https://networking-docs.nvidia.com/doca/archive/3-5-0/hbn-service-configuration)
 
 ---
 
@@ -47,36 +62,42 @@ NVIDIA describes the tenant network as a:
 
 > **pure Type-5 EVPN IP-prefix overlay**
 
-This means NICo does **not** extend a tenant L2 broadcast domain across the fabric.
+This means NICo does **not** extend a tenant L2 broadcast domain across the physical fabric.
+
+Instead, each DPU maintains a local instance of the tenant VPC VRF and exchanges IP-prefix reachability using EVPN Type-5 routes.
 
 ```text
-VPC-A
+                    VPC-A
 
-DPU-1                          DPU-2
-┌──────────────┐              ┌──────────────┐
-│ VRF-A        │              │ VRF-A        │
-│ L3 VNI       │              │ L3 VNI       │
-│ Type-5       │              │ Type-5       │
-└──────┬───────┘              └──────┬───────┘
-       │                             │
-       └──── EVPN IP Prefix ─────────┘
-                  +
-                VXLAN
+DPU-1                                      DPU-2
+
+┌─────────────────┐                    ┌─────────────────┐
+│ VRF-A           │                    │ VRF-A           │
+│ L3VNI: 100001   │                    │ L3VNI: 100001   │
+│ RT: VPC-A       │                    │ RT: VPC-A       │
+└────────┬────────┘                    └────────┬────────┘
+         │                                      │
+         │        EVPN Type-5 Routes            │
+         └──────────────────────────────────────┘
+                    │
+                 VXLAN
+                    │
+              IP Underlay
 ```
 
-The important distinction is:
+The important EVPN route distinction is:
 
 ```text
 EVPN Type-2
-= MAC reachability
-= L2 stretch
+= MAC / MAC+IP Advertisement
+= commonly used for endpoint reachability in L2 VNI overlays
 
 EVPN Type-5
-= IP prefix reachability
-= L3 routed overlay
+= IP Prefix Route
+= prefix-based L3 reachability through an L3VNI
 ```
 
-NICo uses the second model for tenant VPCs.
+NICo uses the second model for tenant VPC routing.
 
 Official references:
 
@@ -85,7 +106,183 @@ Official references:
 
 ---
 
-## ③ Routing and NSG Are Different
+## ③ Tenant Addressing Is Different from VTEP Addressing
+
+NICo separates **tenant attachment addressing** from **overlay transport addressing**.
+
+For an instance interface, NICo allocates a `/31` network from the VPC prefix.
+
+One address belongs to the instance side and the other belongs to the DPU SVI inside the corresponding VPC VRF.
+
+```text
+VpcPrefix
+10.1.0.0/16
+
+        ↓ carve /31
+
+Host / Instance                     DPU / HBN
+
+10.1.1.0/31  ────────────────────  10.1.1.1/31
+                                        │
+                                      SVI
+                                        │
+                                     VRF-A
+```
+
+The `/31` therefore provides the **local L3 attachment between the host and the DPU**.
+
+It is part of the tenant's inner address space.
+
+```text
+Host IP
+10.1.1.0/31
+
+        ↕
+
+DPU SVI
+10.1.1.1/31
+```
+
+Within the same VRF, these attachment prefixes must be unique.
+
+For example:
+
+```text
+VRF-A
+
+Host-1 ↔ DPU
+10.1.1.0/31
+
+Host-2 ↔ DPU
+10.1.1.2/31
+```
+
+However, overlapping tenant prefixes can exist in different VRFs.
+
+```text
+VRF-A
+10.1.1.0/31
+
+VRF-B
+10.1.1.0/31
+```
+
+This is possible because each VRF maintains an independent routing table.
+
+### Overlay Transport
+
+The tenant `/31` is different from the VTEP address used to transport the overlay.
+
+NICo provides a per-VPC DPU loopback, `vpc-dpu-lo`, which acts as the VPC-specific VTEP and EVPN Type-5 next hop.
+
+```text
+Tenant / Inner Address Space
+────────────────────────────────
+
+Host
+10.1.1.0/31
+    │
+DPU SVI
+10.1.1.1/31
+    │
+VRF-A
+    │
+EVPN Type-5
+    │
+L3VNI 100001
+
+
+Overlay Transport
+────────────────────────────────
+
+vpc-dpu-lo
+   │
+ VTEP
+   │
+ VXLAN
+   │
+ IP Underlay
+   │
+ VXLAN
+   │
+ VTEP
+   │
+vpc-dpu-lo
+```
+
+For example:
+
+```text
+DPU-1                                      DPU-2
+
+VRF-A                                      VRF-A
+  │                                          │
+L3VNI 100001                              L3VNI 100001
+  │                                          │
+vpc-dpu-lo                               vpc-dpu-lo
+172.16.1.101                             172.16.1.102
+  │                                          │
+  └──────────── VXLAN / Underlay ────────────┘
+```
+
+The receiving DPU is the remote VTEP.
+
+It decapsulates the VXLAN packet and maps the VNI back to the corresponding tenant VRF.
+
+```text
+DPU-1
+VRF-A
+   ↓
+Route lookup
+   ↓
+EVPN Type-5 next hop
+   ↓
+VXLAN ENCAP
+   ↓
+VTEP-1
+   │
+   │ IP Underlay
+   ▼
+VTEP-2
+   ↓
+VXLAN DECAP
+   ↓
+L3VNI → VRF-A
+   ↓
+DPU-2 tenant attachment
+```
+
+Therefore, the layers can be summarized as:
+
+```text
+Tenant / Overlay Routing Domain
+────────────────────────────────
+Tenant Prefix
+VRF
+EVPN Type-5
+L3VNI
+VXLAN
+VTEP
+
+Transport / Underlay
+────────────────────────────────
+VTEP IP reachability
+BGP IPv4
+ECMP
+Leaf / Spine IP Fabric
+```
+
+A VTEP is an **overlay tunnel endpoint**, while the VTEP IP itself must be reachable through the underlay.
+
+Official references:
+
+- [NICo Network Isolation](https://docs.nvidia.com/infra-controller/documentation/operations-day-2/network-isolation)
+- [NICo VPC Network Virtualization](https://docs.nvidia.com/infra-controller/documentation/operations-day-2/managing-vp-cs/vpc-network-virtualization)
+- [NICo IP and Network Configuration](https://docs.nvidia.com/infra-controller/documentation/provisioning-day-0/ip-and-network-configuration)
+
+---
+
+## ④ Routing and NSG Are Different
 
 The VPC/VRF determines **reachability**.
 
@@ -93,11 +290,13 @@ The NSG determines **which reachable L3/L4 flows are allowed**.
 
 ```text
 Routing
+
 "Where can this packet go?"
 
         ↓
 
-NSG
+Security Policy
+
 "Is this TCP/UDP/ICMP flow allowed?"
 ```
 
@@ -106,29 +305,44 @@ For example:
 ```text
 VPC-A / VRF-A
 
-Instance-A                    Instance-B
-10.1.1.10                     10.1.2.20
-    │                              ▲
-    └──── EVPN Type-5 Routing ─────┘
-                   │
-                   └─ NSG:
-                      TCP/443 Allow
-                      TCP/22  Deny
+Instance-A                         Instance-B
+
+10.1.1.10                          10.1.2.20
+
+    │                                  ▲
+    │                                  │
+    └────── EVPN Type-5 Routing ───────┘
+
+                       +
+                      NSG
+
+                 TCP/443 Allow
+                 TCP/22  Deny
 ```
 
-Changing the NSG does **not** modify the EVPN Type-5 route itself.
+Changing an NSG does **not** modify the EVPN Type-5 route itself.
 
-It only changes packet filtering on top of an existing VPC/VRF routing domain.
+The route may still exist while the corresponding packet flow is denied by policy.
+
+Therefore:
+
+```text
+VRF / EVPN
+= reachability
+
+NSG
+= permitted reachability
+```
 
 ---
 
-## ④ NICo NSG Is Implemented as an HBN/NVUE ACL
+## ⑤ NICo NSG Is Materialized as HBN ACL State
 
 A NICo NSG is not a `DPUService`.
 
-It is a tenant-facing control-plane policy object.
+It is a tenant-facing control-plane policy abstraction.
 
-NVIDIA documents the enforcement flow as:
+The enforcement flow can be understood as:
 
 ```text
 Tenant
@@ -141,12 +355,12 @@ Per-interface desired configuration
   ↓
 DPU Agent
   ↓
-NVUE ACL
+NVUE ACL configuration
   ↓
-Existing HBN DPUService
+HBN dataplane
 ```
 
-The DPU Agent **materializes NSG rules into NVUE ACLs**.
+The DPU Agent materializes NICo security policy as NVUE/HBN ACL configuration on the DPU.
 
 Therefore:
 
@@ -154,28 +368,33 @@ Therefore:
 NSG ≠ HBN DPUService
 
 NSG
-= tenant policy abstraction
+= tenant-facing security policy abstraction
 
-HBN / NVUE ACL
-= enforcement implementation
+NVUE ACL configuration
+= configuration representation
+
+HBN
+= dataplane enforcement
 ```
 
-This also explains why NSG can filter East-West traffic inside a VPC even though the enforcement backend is HBN.
+This explains why a NICo NSG can control traffic between tenant instances even though the actual packet filtering takes place in the HBN dataplane.
 
-Official reference: [NICo Network Security Groups](https://docs.nvidia.com/infra-controller/documentation/operations-day-2/network-security-groups)
+Official reference:
+
+- [NICo Network Security Groups](https://docs.nvidia.com/infra-controller/documentation/operations-day-2/network-security-groups)
 
 ---
 
-## ⑤ HBN ACL vs NICo NSG
+## ⑥ Generic HBN ACL vs NICo NSG
 
-The two are related, but not identical.
+Generic HBN ACLs and NICo NSGs ultimately use the same HBN enforcement domain, but they are exposed at different abstraction levels.
 
 | Policy | Created By | Scope | Enforcement |
 |---|---|---|---|
-| Generic HBN ACL | Infra / Network Admin | Low-level HBN traffic policy | HBN / NVUE |
-| NICo NSG | Tenant | VPC / Instance L3/L4 policy | HBN / NVUE |
+| Generic HBN ACL | Infra / Network Admin | Low-level HBN traffic policy | HBN dataplane, configured through NVUE |
+| NICo NSG | Tenant / NICo API | VPC / Instance L3/L4 policy | HBN dataplane, materialized as NVUE ACL state |
 
-A generic HBN ACL may be attached directly through NVUE.
+An infrastructure administrator can configure supported HBN ACLs directly through NVUE.
 
 ```bash
 nv set acl INFRA-ACL ...
@@ -183,42 +402,71 @@ nv set interface <interface> acl INFRA-ACL inbound
 nv config apply
 ```
 
-A NICo tenant does not need this raw HBN access.
+A tenant does not need direct access to raw HBN or NVUE configuration.
 
-The tenant instead creates an NSG through NICo, and NICo converts it into HBN/NVUE ACL state.
+Instead:
 
 ```text
 Infra Admin
  └─ NVUE / HBN ACL
+       ↓
+     HBN
 
 Tenant
  └─ NICo NSG
-      ↓
+       ↓
     DPU Agent
-      ↓
-    NVUE ACL
+       ↓
+    NVUE ACL state
+       ↓
+      HBN
 ```
 
-So the distinction is mainly **control-plane abstraction and ownership**, not two different firewall engines.
+Therefore, the primary distinction is **control-plane abstraction and ownership**, not two unrelated firewall engines.
+
+Official references:
+
+- [NICo Network Security Groups](https://docs.nvidia.com/infra-controller/documentation/operations-day-2/network-security-groups)
+- [NVIDIA HBN Service Configuration](https://networking-docs.nvidia.com/doca/archive/3-5-0/hbn-service-configuration)
 
 ---
 
-## ⑥ Intra-VPC and Inter-VPC Isolation
+## ⑦ Intra-VPC and Inter-VPC Isolation
 
-NICo uses separate VRFs for separate VPCs.
+NICo creates separate VRFs for separate VPCs.
 
 ```text
-VPC-A                    VPC-B
-VRF-A                    VRF-B
-  │                        │
-  └────────── X ───────────┘
+VPC-A                         VPC-B
+
+VRF-A                         VRF-B
+
+  │                             │
+
+  └──────────── X ──────────────┘
 ```
 
-By default, routes are not leaked between VRFs.
+A VRF represents an independent L3 routing domain.
 
-Therefore, **inter-VPC isolation is primarily routing isolation**, not an ACL that the operator must manually create for every tenant pair.
+Therefore, separate VPC VRFs do not automatically exchange tenant routes.
 
-Cross-VPC reachability must be explicitly enabled, for example through:
+```text
+VRF-A Routing Table
+
+10.1.0.0/16
+10.2.0.0/16
+
+
+VRF-B Routing Table
+
+10.1.0.0/16
+10.3.0.0/16
+```
+
+Even overlapping address ranges can coexist as long as the VRF context remains separate.
+
+Inter-VPC isolation is therefore primarily **routing-domain isolation**, rather than an ACL that must explicitly deny every other tenant.
+
+Cross-VPC connectivity must be intentionally introduced, for example through:
 
 ```text
 Tenant
@@ -227,22 +475,36 @@ Tenant
 or
 
 Operator
- └─ Routing Profile / Route Leak
+ └─ Routing Profile / Controlled Route Leak
 ```
 
-Tenant NSGs then control L3/L4 flows **within an already reachable routing domain**.
+NSGs operate separately from this routing isolation.
 
-NICo also provides operator guardrails that are evaluated before tenant NSGs:
+They control L3/L4 flows after the relevant destination is reachable.
+
+The two concepts should therefore be represented separately.
 
 ```text
+Routing / Reachability
+──────────────────────────────
+
 VPC / VRF Isolation
-      ↓
+        │
+        └─ Explicit cross-VPC connectivity
+           through peering / route leaking
+
+
+Security Policy
+──────────────────────────────
+
 deny_prefixes
       ↓
 policy_overrides
       ↓
 Tenant NSG
 ```
+
+`deny_prefixes` and `policy_overrides` provide operator-controlled guardrails around tenant security policy.
 
 Official references:
 
@@ -251,41 +513,85 @@ Official references:
 
 ---
 
-## ⑦ OVN Is a Separate Workload Policy Domain
+## ⑧ OVN Is a Separate Workload Networking Domain
 
 OVN-Kubernetes is a separate DPU service.
 
-Kubernetes workload policy follows this path:
+It provides Kubernetes workload networking and can offload OVN dataplane processing to the DPU.
+
+Kubernetes workload policy follows a separate control path from NICo NSGs.
 
 ```text
 Kubernetes NetworkPolicy
         ↓
 OVN-Kubernetes
         ↓
-OVN ACL
+OVN logical policy / ACL
         ↓
-OVN DPUService
+OVN dataplane
 ```
 
 Therefore:
 
 ```text
 NICo NSG
- └─ HBN / NVUE ACL
+
+ └─ HBN dataplane
+      ↑
+   NVUE ACL state
+
 
 Kubernetes NetworkPolicy
- └─ OVN ACL
+
+ └─ OVN logical ACL / policy
+      ↓
+   OVN dataplane
 ```
 
-An NSG does not dynamically become an OVN ACL.
+An NSG does **not** dynamically become an OVN ACL.
 
-Official reference: [OVN-Kubernetes ACL Design](https://ovn-kubernetes.io/design/acls/)
+Likewise, a Kubernetes `NetworkPolicy` is not translated into a NICo NSG.
+
+These are separate policy domains.
+
+```text
+NICo / HBN
+= VPC / tenant infrastructure policy
+
+OVN-Kubernetes
+= Kubernetes workload networking policy
+```
+
+Official references:
+
+- [OVN-Kubernetes ACL Design](https://ovn-kubernetes.io/design/acls/)
+- [DPF Architecture Overview](https://networking-docs.nvidia.com/dpf/26.4.0/overview)
 
 ---
 
-## ⑧ HBN and OVN Are Connected by SFC
+## ⑨ HBN and OVN Are Connected Through DPF Service Chaining
 
-When HBN and OVN run together, DPF can connect them through `DPUServiceChain`.
+When HBN and OVN are deployed together, DPF can program connectivity between the services using `DPUServiceInterface` and `DPUServiceChain`.
+
+`DPUServiceChain` is **not another packet-processing or firewall service**.
+
+It is a DPF control-plane object used to describe how traffic is steered between DPU services.
+
+Conceptually:
+
+```text
+Fabric
+   ↕
+HBN
+   ↕
+DPF-programmed OVS connectivity
+   ↕
+OVN
+   ↕
+Workload
+```
+
+The actual DPU connectivity can be represented as:
 
 ```mermaid
 flowchart LR
@@ -293,40 +599,91 @@ flowchart LR
     FABRIC["Physical Fabric"]
 
     subgraph DPU["BlueField DPU"]
+
         HBN["HBN DPUService<br/>VRF / EVPN / VXLAN"]
-        HPOL["HBN/NVUE ACL<br/>Generic ACL + NICo NSG"]
-        SFC["DPF Service Function Chain"]
+
+        HPOL["HBN ACL<br/>Generic ACL + NICo NSG"]
+
+        OVS["DPF-programmed OVS Connectivity<br/>DPUServiceInterface / DPUServiceChain"]
+
         OVN["OVN-Kubernetes DPUService"]
-        OPOL["OVN ACL<br/>NetworkPolicy"]
+
+        OPOL["OVN Logical ACL<br/>NetworkPolicy"]
 
         HPOL --> HBN
-        HBN --> SFC --> OVN
+        HBN <--> OVS
+        OVS <--> OVN
         OPOL --> OVN
+
     end
 
-    POD["Pod"]
+    WORKLOAD["Host / Pod Workload"]
 
-    FABRIC --> HBN
-    OVN --> POD
+    FABRIC <--> HBN
+    OVN <--> WORKLOAD
 ```
 
-`DPUServiceChain` is **traffic steering**, not firewall policy.
+The important distinction is:
 
-Official reference: [DPF DPUServiceChain](https://networking-docs.nvidia.com/dpf/26.4.0/dpuservicechain)
+```text
+DPUService
+= packet-processing function
+
+DPUServiceInterface
+= interface representation used by DPF
+
+DPUServiceChain
+= connectivity / traffic-steering intent
+
+OVS flows / ports
+= dataplane connectivity programmed from that intent
+```
+
+Therefore, SFC connects packet-processing services, but it does **not** merge their policy models.
+
+```text
+NICo NSG
+   ↓
+HBN ACL
+
+          HBN
+           │
+      Service Chain
+           │
+          OVN
+
+OVN NetworkPolicy
+   ↓
+OVN ACL
+```
+
+Official references:
+
+- [DPF Architecture Overview](https://networking-docs.nvidia.com/dpf/26.4.0/overview)
+- [DPF DPUServiceChain](https://networking-docs.nvidia.com/dpf/26.4.0/dpuservicechain)
+- [NVIDIA Reference Design - OVN-Kubernetes and HBN Services](https://networking-docs.nvidia.com/sol/rdg-for-dpf-host-trusted-with-ovn-kubernetes-and-hbn-services-v26_4)
 
 ---
 
 ## Summary
 
-```text
-                  BlueField DPU
+The complete architecture can be viewed as:
 
+```text
+                       BlueField DPU
+
+Tenant / Host
+     │
+     │ /31 Tenant Attachment
+     ▼
 HBN DPUService
- ├─ Native L3 / BGP
+ ├─ SVI
  ├─ VRF
+ ├─ Native L3 / BGP
  ├─ EVPN Type-5
- ├─ L3 VNI / VXLAN
- └─ HBN / NVUE ACL
+ ├─ L3VNI / VXLAN
+ ├─ vpc-dpu-lo / VTEP
+ └─ HBN ACL
       ├─ Generic HBN ACL
       ├─ deny_prefixes
       ├─ policy_overrides
@@ -336,25 +693,71 @@ HBN DPUService
            ↑
           NICo
 
-        │
-        │ DPF SFC
-        ▼
+          │
+          │ DPF-programmed
+          │ Service Chain
+          ▼
 
-OVN DPUService
- └─ OVN ACL
+OVN-Kubernetes DPUService
+ ├─ Kubernetes Workload Networking
+ └─ OVN Logical ACL
       ↑
  Kubernetes NetworkPolicy
 ```
 
+The tenant overlay itself can be summarized as:
+
+```text
+Host / Instance
+Tenant IP
+   │
+   │ /31
+   ▼
+DPU SVI
+   │
+   ▼
+Tenant VRF
+   │
+   ▼
+EVPN Type-5
+   │
+   ▼
+L3VNI
+   │
+   ▼
+vpc-dpu-lo / VTEP
+   │
+   ▼
+VXLAN
+   │
+   ▼
+Leaf / Spine IP Underlay
+   │
+   ▼
+Remote VTEP
+   │
+   ▼
+VXLAN Decapsulation
+   │
+   ▼
+Remote Tenant VRF
+```
+
 The main points are:
 
-- HBN is the DPU network service.
-- NICo VPC uses VRF + L3 VNI + pure EVPN Type-5.
-- NSG does not modify routing. It filters L3/L4 traffic on top of existing VPC routing.
-- NICo NSG is implemented as HBN/NVUE ACL state.
+- HBN is the DPU-side network service.
+- NICo VPCs use separate VRFs and a pure EVPN Type-5 L3 overlay.
+- The Host-DPU `/31` is a tenant-side L3 attachment network, not the VXLAN transport network.
+- `/31` attachment prefixes must be unique inside the same VRF, but can overlap across different VRFs.
+- `vpc-dpu-lo` is the per-VPC DPU VTEP and EVPN Type-5 next hop.
+- The physical underlay provides reachability between VTEPs.
+- L3VNI identifies the tenant VRF context across the VXLAN overlay.
+- The receiving DPU terminates the VXLAN tunnel and maps the L3VNI back to the corresponding VPC VRF.
+- Routing and NSG policy are separate: VRF/EVPN determines reachability, while NSG determines permitted L3/L4 flows.
+- NICo NSGs are materialized as NVUE/HBN ACL configuration and enforced by the HBN dataplane.
 - Inter-VPC isolation is primarily provided by separate VRFs.
-- OVN NetworkPolicy is a separate workload-policy domain.
-- SFC connects DPU services; it does not connect ACL rules.
+- OVN-Kubernetes provides a separate workload-networking and policy domain.
+- `DPUServiceChain` describes traffic steering between DPU services; it is not itself a firewall or packet-processing service.
 
 ---
 
@@ -363,8 +766,10 @@ The main points are:
 - [NVIDIA Infra Controller - Network Isolation](https://docs.nvidia.com/infra-controller/documentation/operations-day-2/network-isolation)
 - [NVIDIA Infra Controller - Network Security Groups](https://docs.nvidia.com/infra-controller/documentation/operations-day-2/network-security-groups)
 - [NVIDIA Infra Controller - VPC Network Virtualization](https://docs.nvidia.com/infra-controller/documentation/operations-day-2/managing-vp-cs/vpc-network-virtualization)
-- [NVIDIA HBN Service Configuration](https://docs.nvidia.com/doca/sdk/hbn%2Bservice%2Bconfiguration/index.html)
+- [NVIDIA Infra Controller - IP and Network Configuration](https://docs.nvidia.com/infra-controller/documentation/provisioning-day-0/ip-and-network-configuration)
+- [NVIDIA HBN Service Configuration](https://networking-docs.nvidia.com/doca/archive/3-5-0/hbn-service-configuration)
 - [DOCA Platform Framework 26.4](https://networking-docs.nvidia.com/dpf/26.4.0/)
 - [DPF Architecture Overview](https://networking-docs.nvidia.com/dpf/26.4.0/overview)
 - [DPF DPUServiceChain](https://networking-docs.nvidia.com/dpf/26.4.0/dpuservicechain)
+- [NVIDIA Reference Design - OVN-Kubernetes and HBN Services](https://networking-docs.nvidia.com/sol/rdg-for-dpf-host-trusted-with-ovn-kubernetes-and-hbn-services-v26_4)
 - [OVN-Kubernetes ACL Design](https://ovn-kubernetes.io/design/acls/)
