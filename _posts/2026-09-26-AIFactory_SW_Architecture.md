@@ -1,12 +1,8 @@
 ---
-title: NVIDIA AI Factory Software Components
-
+title: NVIDIA AI Factory(1) - Software Components
 by: hdimmfh
-
 date: 2026-09-26 15:00:00 +0900
-
 categories: [GPU, AI Factory]
-
 tags: [NVIDIA, NICo, NVCM, Config Manager, NetQ, UFM, NVSentinel, Spectrum-X, InfiniBand]
 ---
 
