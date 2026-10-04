@@ -30,7 +30,7 @@ utilized.
 For instance, the NVIDIA A100 GPU can host up to `64 warps per SM`.\
 If your kernel launches only `32 warps on each SM`, then:
 
-> ▶︎ Occupancy = 32 / 64 = 50%
+> Occupancy = 32 / 64 = 50%
 
 That means only half of the SM's execution slots are actively used.
 
@@ -48,7 +48,7 @@ However, occupancy is **not the sole performance indicator**.
 -   Too high occupancy → less register/shared memory per thread,
     which can reduce efficiency
 
-> ⚠️ In practice, `60~80% occupancy` often yields the best performance --- not 100%.
+> In practice, `60~80% occupancy` often yields the best performance --- not 100%.
 
 ---
 
@@ -75,7 +75,7 @@ However, occupancy is **not the sole performance indicator**.
     active during runtime.\
     Tools like `nvprof` or **Nsight Compute** can report this metric.
 
-> ⚠️ **Important Note:**\
+> **Important Note:**\
 > Theoretical occupancy always assumes the **maximum blocks per SM**.\
 > Therefore, it is **usually higher than the achieved occupancy**
 > measured in real runs.
