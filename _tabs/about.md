@@ -10,7 +10,7 @@ Cloud & AI Infrastructure Engineer focused on GPU systems, distributed computing
 ## 🔗 Links
 
 - GitHub: <https://github.com/hdimmfh>
-- LinkedIn: <https://linkedin.com/in/myeongsu-koo-623805269>
+- LinkedIn: <https://linkedin.com/in/myeongsu-koo>
 
 ## 🍎 Open Source
 
