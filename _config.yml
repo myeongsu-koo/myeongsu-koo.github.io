@@ -21,20 +21,20 @@ tagline: Exploring the boundaries between performance, security, and design. # i
 description: >- # used by seo meta and the atom feed
   NVIDIA GPU, CUDA, MIG/MPS, AMD ROCm, HIP, Nsight, Infiniband·RDMA·MXGPU·SR-IOV 기반 가속기 가상화까지 다루는 HPC 전문 기술
   AWS·GCP 클라우드 아키텍처, Linux 시스템, 네트워크 엔지니어링(Cisco) 등 고성능 인프라 전반
-  hdimmfh.github.io, 구명수, 한양대, LG CNS, Myeongsu Koo
+  myeongsu-koo.github.io, 구명수, 한양대, LG CNS, Myeongsu Koo
   
 # Fill in the protocol & hostname for your site.
 # E.g. 'https://username.github.io', note that it does not end with a '/'.
-url: "https://hdimmfh.github.io"
+url: "https://myeongsu-koo.github.io"
 baseurl: ""
 
 author:
-  name: "hdimmfh"
+  name: "myeongsu-koo"
   url: "https://www.linkedin.com/in/myeongsu-koo-623805269/"
   email: "audtn256699@gmail.com"
 
 github:
-  username: hdimmfh # change to your GitHub username
+  username: myeongsu-koo # change to your GitHub username
 
 twitter:
   username: # change to your Twitter username
@@ -42,13 +42,13 @@ twitter:
 social:
   # Change to your full name.
   # It will be displayed as the default author of the posts and the copyright owner in the Footer
-  name: "hdimmfh"
+  name: "myeongsu-koo"
   email: "audtn256699@gmail.com" # change to your email address
   links:
     - https://www.linkedin.com/in/myeongsu-koo-623805269
     # The first element serves as the copyright owner's link
     # - https://twitter.com/username # change to your Twitter homepage
-    - https://github.com/hdimmfh # change to your GitHub homepage
+    - https://github.com/myeongsu-koo # change to your GitHub homepage
     # Uncomment below to add more social links
     # - https://www.facebook.com/username
 
